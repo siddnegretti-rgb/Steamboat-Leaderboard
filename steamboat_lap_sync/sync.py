@@ -2,10 +2,13 @@ import argparse
 import json
 import os
 import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import sys
 from typing import Dict, Optional
 
 import requests
+from twilio.rest import Client
 from playwright.sync_api import Locator, Page, sync_playwright
 
 SOURCE_URL = "https://29029.co/products/steamboat-2026"
@@ -41,50 +44,84 @@ def first_visible(locator: Locator) -> Optional[Locator]:
     return None
 
 
-def find_ascent_search(page: Page) -> Locator:
-    """Find the participant search input near the Ascent Board.
+def _scroll_full_page(page: Page):
+    """Scroll progressively so lazy-loaded embeds near the bottom are initialized."""
+    try:
+        height = page.evaluate("document.body.scrollHeight")
+        y = 0
+        while y < height:
+            page.evaluate("window.scrollTo(0, arguments[0])", y)
+            page.wait_for_timeout(350)
+            y += 900
+            height = page.evaluate("document.body.scrollHeight")
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(1800)
+    except Exception:
+        pass
 
-    The live board is client-rendered, so this intentionally tries several semantic
-    selectors rather than depending on one fragile CSS class.
-    """
-    heading = page.get_by_text("Ascent Board", exact=False)
-    if heading.count():
+
+def _candidate_searches(ctx):
+    return [
+        ctx.get_by_role("searchbox"),
+        ctx.locator('input[type="search"]'),
+        ctx.locator('input[placeholder*="search" i]'),
+        ctx.locator('input[aria-label*="search" i]'),
+        ctx.locator('input[placeholder*="participant" i]'),
+        ctx.locator('input[aria-label*="participant" i]'),
+        ctx.locator('input[placeholder*="name" i]'),
+    ]
+
+
+def find_ascent_search(page: Page) -> Locator:
+    """Find the participant search input on the page or inside an embedded frame."""
+    # Scroll the entire page first because the board is near the bottom and may lazy-load.
+    _scroll_full_page(page)
+
+    # Try the main page plus every iframe. Playwright Frame exposes the same locator APIs.
+    contexts = [page] + list(page.frames)
+    seen = set()
+    for ctx in contexts:
+        key = getattr(ctx, "url", "") or str(id(ctx))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        for locator in _candidate_searches(ctx):
+            try:
+                count = locator.count()
+            except Exception:
+                continue
+            for i in range(count):
+                item = locator.nth(i)
+                try:
+                    if item.is_visible():
+                        return item
+                except Exception:
+                    continue
+
+    # Last-resort diagnostic: print frames and visible inputs to the Actions log.
+    print("DIAGNOSTIC: search input not found. Frames:", file=sys.stderr)
+    for i, frame in enumerate(page.frames):
         try:
-            heading.last.scroll_into_view_if_needed()
+            print(f"  frame[{i}] url={frame.url}", file=sys.stderr)
+            inputs = frame.locator("input")
+            for j in range(min(inputs.count(), 20)):
+                inp = inputs.nth(j)
+                try:
+                    print(
+                        "    input", j,
+                        "type=", inp.get_attribute("type"),
+                        "placeholder=", inp.get_attribute("placeholder"),
+                        "aria-label=", inp.get_attribute("aria-label"),
+                        "visible=", inp.is_visible(),
+                        file=sys.stderr,
+                    )
+                except Exception:
+                    pass
         except Exception:
             pass
 
-    candidates = [
-        page.get_by_role("searchbox"),
-        page.locator('input[type="search"]'),
-        page.locator('input[placeholder*="search" i]'),
-        page.locator('input[aria-label*="search" i]'),
-        page.locator('input[placeholder*="participant" i]'),
-        page.locator('input[aria-label*="participant" i]'),
-    ]
-
-    # Prefer a visible input in the lower half of the document, where the Ascent Board sits.
-    viewport_h = page.viewport_size["height"] if page.viewport_size else 900
-    for locator in candidates:
-        for i in range(locator.count()):
-            item = locator.nth(i)
-            try:
-                if not item.is_visible():
-                    continue
-                box = item.bounding_box()
-                if box and box["y"] > viewport_h * 0.35:
-                    return item
-            except Exception:
-                continue
-
-    # Fall back to the first visible semantic search input.
-    for locator in candidates:
-        item = first_visible(locator)
-        if item is not None:
-            return item
-
     raise RuntimeError("Could not find the Ascent Board participant search input")
-
 
 def extract_lap(text: str, name: str) -> Optional[int]:
     t = re.sub(r"\s+", " ", text or " ")
@@ -109,45 +146,78 @@ def extract_lap(text: str, name: str) -> Optional[int]:
 
 
 def read_filtered_result(page: Page, name: str, search: Locator) -> Optional[int]:
-    """Type a participant name into the board search and read that result's lap count."""
+    """Type a participant name and read the ASCENTS value from that participant's table row."""
     search.fill("")
     search.fill(name)
     page.wait_for_timeout(1300)
 
-    # First preference: a visible result container that includes the exact participant name.
-    name_loc = page.get_by_text(name, exact=True)
-    for i in range(name_loc.count()):
-        el = name_loc.nth(i)
-        try:
-            if not el.is_visible():
-                continue
-        except Exception:
+    # The 29029 board is a table. After filtering, identify the row containing
+    # the participant and read the numeric ASCENTS cell from that row.
+    contexts = [page] + list(page.frames)
+    seen = set()
+
+    for ctx in contexts:
+        key = getattr(ctx, "url", "") or str(id(ctx))
+        if key in seen:
             continue
+        seen.add(key)
 
-        # Walk upward through row/card ancestors. Stop before grabbing huge page sections.
-        target = el
-        for _ in range(8):
-            try:
-                txt = target.inner_text(timeout=2500)
-            except Exception:
-                txt = ""
-            if txt and len(txt) <= 1800 and normalize(name) in normalize(txt):
-                lap = extract_lap(txt, name)
-                if lap is not None:
-                    return lap
-            target = target.locator("xpath=..")
+        # Prefer an actual table row containing the participant's full name.
+        try:
+            rows = ctx.locator("tr").filter(has_text=name)
+            for i in range(rows.count()):
+                row = rows.nth(i)
+                if not row.is_visible():
+                    continue
 
-    # Second preference: after filtering, inspect visible text in the board/search vicinity.
-    try:
-        body_text = page.locator("body").inner_text(timeout=5000)
-        idx = body_text.casefold().find(name.casefold())
-        if idx >= 0:
-            snippet = body_text[max(0, idx - 180): idx + 520]
-            lap = extract_lap(snippet, name)
-            if lap is not None:
-                return lap
-    except Exception:
-        pass
+                cells = row.locator("th, td")
+                values = []
+                for j in range(cells.count()):
+                    try:
+                        value = re.sub(r"\s+", " ", cells.nth(j).inner_text()).strip()
+                        if value:
+                            values.append(value)
+                    except Exception:
+                        pass
+
+                # In the live board screenshots the participant name is one cell
+                # and ASCENTS is the numeric cell to its right. Work from right
+                # to left so rank/bib-like values elsewhere cannot win.
+                for value in reversed(values):
+                    if re.fullmatch(r"\d{1,2}", value):
+                        n = int(value)
+                        if 0 <= n <= 20:
+                            return n
+
+                # If cell extraction failed, parse the compact row text only.
+                row_text = re.sub(r"\s+", " ", row.inner_text()).strip()
+                nums = [int(x) for x in re.findall(r"(?<!\d)(\d{1,2})(?!\d)", row_text)]
+                nums = [n for n in nums if 0 <= n <= 20]
+                if nums:
+                    return nums[-1]
+        except Exception:
+            pass
+
+    # Fallback for a non-table rendering: use the smallest visible ancestor
+    # containing the exact participant name, rather than a large page snippet.
+    for ctx in contexts:
+        try:
+            name_loc = ctx.get_by_text(name, exact=True)
+            for i in range(name_loc.count()):
+                el = name_loc.nth(i)
+                if not el.is_visible():
+                    continue
+                target = el
+                for _ in range(5):
+                    txt = re.sub(r"\s+", " ", target.inner_text(timeout=2500)).strip()
+                    if txt and len(txt) <= 400 and normalize(name) in normalize(txt):
+                        nums = [int(x) for x in re.findall(r"(?<!\d)(\d{1,2})(?!\d)", txt)]
+                        nums = [n for n in nums if 0 <= n <= 20]
+                        if nums:
+                            return nums[-1]
+                    target = target.locator("xpath=..")
+        except Exception:
+            pass
 
     return None
 
@@ -162,9 +232,19 @@ def scrape_laps(debug_dir: Optional[str] = None) -> Dict[str, int]:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": 1440, "height": 1400})
         page.goto(SOURCE_URL, wait_until="domcontentloaded", timeout=120000)
-        page.wait_for_timeout(7000)
+        page.wait_for_timeout(8000)
 
-        search = find_ascent_search(page)
+        try:
+            search = find_ascent_search(page)
+        except Exception:
+            if debug_dir:
+                page.screenshot(path=os.path.join(debug_dir, "search_not_found.png"), full_page=True)
+                try:
+                    with open(os.path.join(debug_dir, "page.html"), "w", encoding="utf-8") as f:
+                        f.write(page.content())
+                except Exception:
+                    pass
+            raise
         try:
             search.scroll_into_view_if_needed()
         except Exception:
@@ -226,8 +306,36 @@ def update_lap(token: str, board_id: int, item_id: str, column_id: str, lap: int
     })
 
 
+
+def send_sms(laps: Dict[str, Optional[int]]) -> None:
+    sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    token = os.environ.get("TWILIO_AUTH_TOKEN")
+    from_number = os.environ.get("TWILIO_FROM_NUMBER")
+    to_number = os.environ.get("SMS_TO_NUMBER")
+
+    missing = [name for name, value in {
+        "TWILIO_ACCOUNT_SID": sid,
+        "TWILIO_AUTH_TOKEN": token,
+        "TWILIO_FROM_NUMBER": from_number,
+        "SMS_TO_NUMBER": to_number,
+    }.items() if not value]
+    if missing:
+        raise RuntimeError("Missing Twilio environment variables: " + ", ".join(missing))
+
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    lines = [f"29029 Steamboat — {now_et.strftime('%-I:%M %p ET')}", ""]
+    for name in PARTICIPANTS:
+        value = laps.get(name)
+        lines.append(f"{name} — {value if value is not None else 'Not found'}")
+    body = "\n".join(lines)
+
+    client = Client(sid, token)
+    message = client.messages.create(body=body, from_=from_number, to=to_number)
+    print(f"SMS sent successfully: {message.sid}")
+
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--send-sms", action="store_true", help="Send the scraped lap report by SMS using Twilio environment variables.")
     parser.add_argument("--scrape-only", action="store_true", help="Read and print lap counts; do not touch Monday")
     parser.add_argument("--debug-dir", help="Optional directory for one screenshot per participant lookup")
     args = parser.parse_args()
@@ -236,6 +344,9 @@ def main():
     print("\nCurrent lap counts (last-name order):")
     for name in PARTICIPANTS:
         print(f"- {name}: {laps.get(name, 'NOT FOUND')}")
+
+    if args.send_sms:
+        send_sms(laps)
 
     if args.scrape_only:
         if not laps:
