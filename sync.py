@@ -41,50 +41,84 @@ def first_visible(locator: Locator) -> Optional[Locator]:
     return None
 
 
-def find_ascent_search(page: Page) -> Locator:
-    """Find the participant search input near the Ascent Board.
+def _scroll_full_page(page: Page):
+    """Scroll progressively so lazy-loaded embeds near the bottom are initialized."""
+    try:
+        height = page.evaluate("document.body.scrollHeight")
+        y = 0
+        while y < height:
+            page.evaluate("window.scrollTo(0, arguments[0])", y)
+            page.wait_for_timeout(350)
+            y += 900
+            height = page.evaluate("document.body.scrollHeight")
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(1800)
+    except Exception:
+        pass
 
-    The live board is client-rendered, so this intentionally tries several semantic
-    selectors rather than depending on one fragile CSS class.
-    """
-    heading = page.get_by_text("Ascent Board", exact=False)
-    if heading.count():
+
+def _candidate_searches(ctx):
+    return [
+        ctx.get_by_role("searchbox"),
+        ctx.locator('input[type="search"]'),
+        ctx.locator('input[placeholder*="search" i]'),
+        ctx.locator('input[aria-label*="search" i]'),
+        ctx.locator('input[placeholder*="participant" i]'),
+        ctx.locator('input[aria-label*="participant" i]'),
+        ctx.locator('input[placeholder*="name" i]'),
+    ]
+
+
+def find_ascent_search(page: Page) -> Locator:
+    """Find the participant search input on the page or inside an embedded frame."""
+    # Scroll the entire page first because the board is near the bottom and may lazy-load.
+    _scroll_full_page(page)
+
+    # Try the main page plus every iframe. Playwright Frame exposes the same locator APIs.
+    contexts = [page] + list(page.frames)
+    seen = set()
+    for ctx in contexts:
+        key = getattr(ctx, "url", "") or str(id(ctx))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        for locator in _candidate_searches(ctx):
+            try:
+                count = locator.count()
+            except Exception:
+                continue
+            for i in range(count):
+                item = locator.nth(i)
+                try:
+                    if item.is_visible():
+                        return item
+                except Exception:
+                    continue
+
+    # Last-resort diagnostic: print frames and visible inputs to the Actions log.
+    print("DIAGNOSTIC: search input not found. Frames:", file=sys.stderr)
+    for i, frame in enumerate(page.frames):
         try:
-            heading.last.scroll_into_view_if_needed()
+            print(f"  frame[{i}] url={frame.url}", file=sys.stderr)
+            inputs = frame.locator("input")
+            for j in range(min(inputs.count(), 20)):
+                inp = inputs.nth(j)
+                try:
+                    print(
+                        "    input", j,
+                        "type=", inp.get_attribute("type"),
+                        "placeholder=", inp.get_attribute("placeholder"),
+                        "aria-label=", inp.get_attribute("aria-label"),
+                        "visible=", inp.is_visible(),
+                        file=sys.stderr,
+                    )
+                except Exception:
+                    pass
         except Exception:
             pass
 
-    candidates = [
-        page.get_by_role("searchbox"),
-        page.locator('input[type="search"]'),
-        page.locator('input[placeholder*="search" i]'),
-        page.locator('input[aria-label*="search" i]'),
-        page.locator('input[placeholder*="participant" i]'),
-        page.locator('input[aria-label*="participant" i]'),
-    ]
-
-    # Prefer a visible input in the lower half of the document, where the Ascent Board sits.
-    viewport_h = page.viewport_size["height"] if page.viewport_size else 900
-    for locator in candidates:
-        for i in range(locator.count()):
-            item = locator.nth(i)
-            try:
-                if not item.is_visible():
-                    continue
-                box = item.bounding_box()
-                if box and box["y"] > viewport_h * 0.35:
-                    return item
-            except Exception:
-                continue
-
-    # Fall back to the first visible semantic search input.
-    for locator in candidates:
-        item = first_visible(locator)
-        if item is not None:
-            return item
-
     raise RuntimeError("Could not find the Ascent Board participant search input")
-
 
 def extract_lap(text: str, name: str) -> Optional[int]:
     t = re.sub(r"\s+", " ", text or " ")
@@ -162,9 +196,19 @@ def scrape_laps(debug_dir: Optional[str] = None) -> Dict[str, int]:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": 1440, "height": 1400})
         page.goto(SOURCE_URL, wait_until="domcontentloaded", timeout=120000)
-        page.wait_for_timeout(7000)
+        page.wait_for_timeout(8000)
 
-        search = find_ascent_search(page)
+        try:
+            search = find_ascent_search(page)
+        except Exception:
+            if debug_dir:
+                page.screenshot(path=os.path.join(debug_dir, "search_not_found.png"), full_page=True)
+                try:
+                    with open(os.path.join(debug_dir, "page.html"), "w", encoding="utf-8") as f:
+                        f.write(page.content())
+                except Exception:
+                    pass
+            raise
         try:
             search.scroll_into_view_if_needed()
         except Exception:
