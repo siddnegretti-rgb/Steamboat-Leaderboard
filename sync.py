@@ -2,10 +2,13 @@ import argparse
 import json
 import os
 import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import sys
 from typing import Dict, Optional
 
 import requests
+from twilio.rest import Client
 from playwright.sync_api import Locator, Page, sync_playwright
 
 SOURCE_URL = "https://29029.co/products/steamboat-2026"
@@ -303,8 +306,36 @@ def update_lap(token: str, board_id: int, item_id: str, column_id: str, lap: int
     })
 
 
+
+def send_sms(laps: Dict[str, Optional[int]]) -> None:
+    sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    token = os.environ.get("TWILIO_AUTH_TOKEN")
+    from_number = os.environ.get("TWILIO_FROM_NUMBER")
+    to_number = os.environ.get("SMS_TO_NUMBER")
+
+    missing = [name for name, value in {
+        "TWILIO_ACCOUNT_SID": sid,
+        "TWILIO_AUTH_TOKEN": token,
+        "TWILIO_FROM_NUMBER": from_number,
+        "SMS_TO_NUMBER": to_number,
+    }.items() if not value]
+    if missing:
+        raise RuntimeError("Missing Twilio environment variables: " + ", ".join(missing))
+
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    lines = [f"29029 Steamboat — {now_et.strftime('%-I:%M %p ET')}", ""]
+    for name in PARTICIPANTS:
+        value = laps.get(name)
+        lines.append(f"{name} — {value if value is not None else 'Not found'}")
+    body = "\n".join(lines)
+
+    client = Client(sid, token)
+    message = client.messages.create(body=body, from_=from_number, to=to_number)
+    print(f"SMS sent successfully: {message.sid}")
+
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--send-sms", action="store_true", help="Send the scraped lap report by SMS using Twilio environment variables.")
     parser.add_argument("--scrape-only", action="store_true", help="Read and print lap counts; do not touch Monday")
     parser.add_argument("--debug-dir", help="Optional directory for one screenshot per participant lookup")
     args = parser.parse_args()
@@ -313,6 +344,9 @@ def main():
     print("\nCurrent lap counts (last-name order):")
     for name in PARTICIPANTS:
         print(f"- {name}: {laps.get(name, 'NOT FOUND')}")
+
+    if args.send_sms:
+        send_sms(laps)
 
     if args.scrape_only:
         if not laps:
