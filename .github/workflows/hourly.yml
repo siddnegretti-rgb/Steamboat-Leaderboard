@@ -8,25 +8,24 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-
     steps:
       - name: Get tracker files
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
       - name: Install Python packages
         run: pip install -r requirements.txt
-
       - name: Install Chromium
         run: playwright install --with-deps chromium
-
-      - name: Scrape 29029 Ascent Board
-        run: python sync.py --scrape-only --debug-dir debug
-
+      - name: Scrape 29029 Ascent Board and send SMS
+        env:
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_FROM_NUMBER: ${{ secrets.TWILIO_FROM_NUMBER }}
+          SMS_TO_NUMBER: ${{ secrets.SMS_TO_NUMBER }}
+        run: python sync.py --scrape-only --send-sms --debug-dir debug
       - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
