@@ -1,0 +1,28 @@
+name: Steamboat Lap Tracker
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '7 * * * *'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get tracker files
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      - name: Install Chromium
+        run: playwright install --with-deps chromium
+
+      - name: Scrape 29029 Ascent Board
+        run: python sync.py
