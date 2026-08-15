@@ -143,45 +143,78 @@ def extract_lap(text: str, name: str) -> Optional[int]:
 
 
 def read_filtered_result(page: Page, name: str, search: Locator) -> Optional[int]:
-    """Type a participant name into the board search and read that result's lap count."""
+    """Type a participant name and read the ASCENTS value from that participant's table row."""
     search.fill("")
     search.fill(name)
     page.wait_for_timeout(1300)
 
-    # First preference: a visible result container that includes the exact participant name.
-    name_loc = page.get_by_text(name, exact=True)
-    for i in range(name_loc.count()):
-        el = name_loc.nth(i)
-        try:
-            if not el.is_visible():
-                continue
-        except Exception:
+    # The 29029 board is a table. After filtering, identify the row containing
+    # the participant and read the numeric ASCENTS cell from that row.
+    contexts = [page] + list(page.frames)
+    seen = set()
+
+    for ctx in contexts:
+        key = getattr(ctx, "url", "") or str(id(ctx))
+        if key in seen:
             continue
+        seen.add(key)
 
-        # Walk upward through row/card ancestors. Stop before grabbing huge page sections.
-        target = el
-        for _ in range(8):
-            try:
-                txt = target.inner_text(timeout=2500)
-            except Exception:
-                txt = ""
-            if txt and len(txt) <= 1800 and normalize(name) in normalize(txt):
-                lap = extract_lap(txt, name)
-                if lap is not None:
-                    return lap
-            target = target.locator("xpath=..")
+        # Prefer an actual table row containing the participant's full name.
+        try:
+            rows = ctx.locator("tr").filter(has_text=name)
+            for i in range(rows.count()):
+                row = rows.nth(i)
+                if not row.is_visible():
+                    continue
 
-    # Second preference: after filtering, inspect visible text in the board/search vicinity.
-    try:
-        body_text = page.locator("body").inner_text(timeout=5000)
-        idx = body_text.casefold().find(name.casefold())
-        if idx >= 0:
-            snippet = body_text[max(0, idx - 180): idx + 520]
-            lap = extract_lap(snippet, name)
-            if lap is not None:
-                return lap
-    except Exception:
-        pass
+                cells = row.locator("th, td")
+                values = []
+                for j in range(cells.count()):
+                    try:
+                        value = re.sub(r"\s+", " ", cells.nth(j).inner_text()).strip()
+                        if value:
+                            values.append(value)
+                    except Exception:
+                        pass
+
+                # In the live board screenshots the participant name is one cell
+                # and ASCENTS is the numeric cell to its right. Work from right
+                # to left so rank/bib-like values elsewhere cannot win.
+                for value in reversed(values):
+                    if re.fullmatch(r"\d{1,2}", value):
+                        n = int(value)
+                        if 0 <= n <= 20:
+                            return n
+
+                # If cell extraction failed, parse the compact row text only.
+                row_text = re.sub(r"\s+", " ", row.inner_text()).strip()
+                nums = [int(x) for x in re.findall(r"(?<!\d)(\d{1,2})(?!\d)", row_text)]
+                nums = [n for n in nums if 0 <= n <= 20]
+                if nums:
+                    return nums[-1]
+        except Exception:
+            pass
+
+    # Fallback for a non-table rendering: use the smallest visible ancestor
+    # containing the exact participant name, rather than a large page snippet.
+    for ctx in contexts:
+        try:
+            name_loc = ctx.get_by_text(name, exact=True)
+            for i in range(name_loc.count()):
+                el = name_loc.nth(i)
+                if not el.is_visible():
+                    continue
+                target = el
+                for _ in range(5):
+                    txt = re.sub(r"\s+", " ", target.inner_text(timeout=2500)).strip()
+                    if txt and len(txt) <= 400 and normalize(name) in normalize(txt):
+                        nums = [int(x) for x in re.findall(r"(?<!\d)(\d{1,2})(?!\d)", txt)]
+                        nums = [n for n in nums if 0 <= n <= 20]
+                        if nums:
+                            return nums[-1]
+                    target = target.locator("xpath=..")
+        except Exception:
+            pass
 
     return None
 
