@@ -25,4 +25,12 @@ jobs:
         run: playwright install --with-deps chromium
 
       - name: Scrape 29029 Ascent Board
-        run: python sync.py
+        run: python sync.py --scrape-only --debug-dir debug
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: steamboat-debug
+          path: debug/
+          if-no-files-found: ignore
